@@ -1,0 +1,289 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: fleet_broker
+    ports:
+      - "1884:1883"   # MQTT TCP (host:1884 → container:1883)
+      - "9002:9001"   # MQTT WebSocket (browser clients)
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
+    networks:
+      - fleet_net
+    healthcheck:
+      test: ["CMD", "mosquitto_pub", "-h", "localhost", "-t", "health", "-m", "ping", "-q", "0"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  simulator:
+    build: ./simulator
+    container_name: fleet_simulator
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    environment:
+      - BROKER_HOST=mosquitto
+      - BROKER_PORT=1883
+    networks:
+      - fleet_net
+    restart: on-failure
+
+  nextjs-dashboard:
+    build: ./nextjs-dashboard
+    container_name: fleet_nextjs
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    ports:
+      - "3000:3000"   # → http://localhost:3000
+    environment:
+      # The browser connects to the broker WebSocket from the host machine
+      - NEXT_PUBLIC_BROKER_WS_URL=ws://localhost:9002
+    networks:
+      - fleet_net
+    restart: on-failure
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: fleet_kafka
+    environment:
+      - CLUSTER_ID=MkU3OEVBNTcwNTJENDM2Qk
+      - KAFKA_NODE_ID=1
+      - KAFKA_PROCESS_ROLES=broker,controller
+      - KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
+      - KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:9094
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9094
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      - KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_INTER_BROKER_LISTENER_NAME=PLAINTEXT
+      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
+      - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
+      - KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0
+      - KAFKA_AUTO_CREATE_TOPICS_ENABLE=true
+    ports:
+      - "9094:9094"
+    volumes:
+      - kafka_data:/bitnami/kafka
+    networks:
+      - fleet_net
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.1
+    container_name: fleet_schema_registry
+    depends_on:
+      kafka:
+          condition: service_started
+    environment:
+      - SCHEMA_REGISTRY_HOST_NAME=schema-registry
+      - SCHEMA_REGISTRY_LISTENERS=http://0.0.0.0:8081
+      - SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS=PLAINTEXT://kafka:9092
+    ports:
+      - "8081:8081"
+    networks:
+      - fleet_net
+
+  prometheus:
+    image: prom/prometheus:v2.53.1
+    container_name: fleet_prometheus
+    depends_on:
+      fastapi-gateway:
+        condition: service_started
+      mqtt-to-kafka-bridge:
+        condition: service_started
+      kafka-to-mqtt-bridge:
+        condition: service_started
+      timescaledb-audit-etl:
+        condition: service_started
+      timescaledb-telemetry-etl:
+        condition: service_started
+      timescaledb-event-etl:
+        condition: service_started
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    volumes:
+      - ./infra/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/observability/alert.rules.yml:/etc/prometheus/alert.rules.yml:ro
+    ports:
+      - "9090:9090"
+    networks:
+      - fleet_net
+    restart: on-failure
+
+  timescaledb:
+    image: timescale/timescaledb:2.14.2-pg15
+    container_name: fleet_timescaledb
+    environment:
+      - POSTGRES_DB=fleetdb
+      - POSTGRES_USER=fleet
+      - POSTGRES_PASSWORD=fleetpass
+    ports:
+      - "5433:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+    networks:
+      - fleet_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fleet -d fleetdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: fleet_nginx
+    depends_on:
+      fastapi-gateway:
+        condition: service_started
+    ports:
+      - "8080:80"
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infra/nginx/conf.d:/etc/nginx/conf.d:ro
+    networks:
+      - fleet_net
+    restart: on-failure
+
+  fastapi-gateway:
+    build: ./backend/fastapi-gateway
+    container_name: fleet_fastapi_gateway
+    depends_on:
+      kafka:
+        condition: service_started
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_COMMAND_TOPIC=fleet-commands
+      - KAFKA_TELEMETRY_TOPIC=raw-telemetry
+      - KAFKA_TELEMETRY_CONSUMER_GROUP=fastapi-sse-group
+      - SERVICE_NAME=fastapi-gateway
+      - DB_HOST=timescaledb
+      - DB_PORT=5432
+      - DB_NAME=fleetdb
+      - DB_USER=fleet
+      - DB_PASSWORD=fleetpass
+    networks:
+      - fleet_net
+    restart: on-failure
+
+  kafka-to-mqtt-bridge:
+    build: ./services/kafka-to-mqtt-bridge
+    container_name: fleet_kafka_to_mqtt_bridge
+    depends_on:
+      kafka:
+        condition: service_started
+      mosquitto:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_COMMAND_TOPIC=fleet-commands
+      - KAFKA_GROUP_ID=mqtt-outbound-bridge-group
+      - MQTT_HOST=mosquitto
+      - MQTT_PORT=1883
+      - MQTT_QOS=1
+      - DEDUP_CACHE_SIZE=20000
+      - METRICS_PORT=9102
+    networks:
+      - fleet_net
+    restart: on-failure
+
+  timescaledb-audit-etl:
+    build: ./workers/timescaledb-audit-etl
+    container_name: fleet_timescaledb_audit_etl
+    depends_on:
+      kafka:
+        condition: service_started
+      timescaledb:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_COMMAND_TOPIC=fleet-commands
+      - KAFKA_GROUP_ID=timescaledb-audit-etl-group
+      - KAFKA_AUTO_OFFSET_RESET=latest
+      - DB_HOST=timescaledb
+      - DB_PORT=5432
+      - DB_NAME=fleetdb
+      - DB_USER=fleet
+      - DB_PASSWORD=fleetpass
+      - METRICS_PORT=9103
+    networks:
+      - fleet_net
+    restart: on-failure
+
+  mqtt-to-kafka-bridge:
+    build: ./services/mqtt-to-kafka-bridge
+    container_name: fleet_mqtt_to_kafka_bridge
+    depends_on:
+      kafka:
+        condition: service_started
+      mosquitto:
+        condition: service_healthy
+    environment:
+      - MQTT_HOST=mosquitto
+      - MQTT_PORT=1883
+      - MQTT_TOPIC=fleet/bus/+/telemetry
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TELEMETRY_TOPIC=raw-telemetry
+      - KAFKA_DLQ_TOPIC=raw-telemetry-dlq
+      - SERVICE_NAME=mqtt-to-kafka-bridge
+      - METRICS_PORT=9101
+    networks:
+      - fleet_net
+    restart: on-failure
+
+  timescaledb-telemetry-etl:
+    build: ./workers/timescaledb-telemetry-etl
+    container_name: fleet_timescaledb_telemetry_etl
+    depends_on:
+      kafka:
+        condition: service_started
+      timescaledb:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TELEMETRY_TOPIC=raw-telemetry
+      - KAFKA_GROUP_ID=timescaledb-telemetry-etl-group
+      - KAFKA_AUTO_OFFSET_RESET=latest
+      - DB_HOST=timescaledb
+      - DB_PORT=5432
+      - DB_NAME=fleetdb
+      - DB_USER=fleet
+      - DB_PASSWORD=fleetpass
+      - METRICS_PORT=9104
+    networks:
+      - fleet_net
+    restart: on-failure
+
+  timescaledb-event-etl:
+    build: ./workers/timescaledb-event-etl
+    container_name: fleet_timescaledb_event_etl
+    depends_on:
+      kafka:
+        condition: service_started
+      timescaledb:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TELEMETRY_TOPIC=raw-telemetry
+      - KAFKA_GROUP_ID=timescaledb-event-etl-group
+      - KAFKA_AUTO_OFFSET_RESET=latest
+      - DB_HOST=timescaledb
+      - DB_PORT=5432
+      - DB_NAME=fleetdb
+      - DB_USER=fleet
+      - DB_PASSWORD=fleetpass
+      - METRICS_PORT=9105
+    networks:
+      - fleet_net
+    restart: on-failure
+
+networks:
+  fleet_net:
+    driver: bridge
+
+volumes:
+  kafka_data:
+  timescaledb_data:
